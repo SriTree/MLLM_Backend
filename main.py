@@ -16,6 +16,11 @@ try:
 except LookupError:
     nltk.download('punkt')
 
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab')
+
 app = FastAPI()
 
 # Add CORS middleware - updated to allow requests from any origin for deployment
