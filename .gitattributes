@@ -1,1 +1,2 @@
 enhanced_transcript_highlighter/**/* filter=lfs diff=lfs merge=lfs -text
+enhanced_transcript_highlighter/**/*.json filter=lfs diff=lfs merge=lfs -text
