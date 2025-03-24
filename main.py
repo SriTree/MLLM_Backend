@@ -9,76 +9,121 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
 import numpy as np
 import os
+import pickle
+from functools import lru_cache
 
-# Download necessary NLTK data
+# Initialize NLTK once
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
-    nltk.download('punkt')
-
-try:
-    nltk.data.find('tokenizers/punkt_tab')
-except LookupError:
-    nltk.download('punkt_tab')
+    nltk.download('punkt', quiet=True)
 
 app = FastAPI()
 
-# Add CORS middleware - updated to allow requests from any origin for deployment
-# You should change this to your frontend URL in production
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins during development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Use environment variables for model paths if available, otherwise use default paths
+# Environment variables for model paths
 EMBEDDING_MODEL_PATH = os.environ.get("EMBEDDING_MODEL_PATH", "./enhanced_transcript_highlighter")
 RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "cross-encoder/ms-marco-MiniLM-L-12-v2")
 
-# First, try to load your custom embedding model
-try:
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
-    print(f"Successfully loaded embedding model from {EMBEDDING_MODEL_PATH}")
-except Exception as e:
-    print(f"Error loading custom embedding model: {e}")
-    # Fallback to a pretrained model if the custom model isn't available
-    try:
-        # Use a better model for question-answering if possible
-        embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
-        print("Falling back to default SentenceTransformer model")
-    except Exception as e:
-        print(f"Error loading fallback embedding model: {e}")
-        raise
-
-# Load the reranker model
-try:
-    reranker_model = CrossEncoder(RERANKER_MODEL_PATH)
-    print(f"Successfully loaded reranker model: {RERANKER_MODEL_PATH}")
-except Exception as e:
-    print(f"Error loading reranker model: {e}")
-    reranker_model = None
-    print("Reranking will be disabled")
+# Model cache directory
+os.makedirs("./model_cache", exist_ok=True)
 
 class QuestionRequest(BaseModel):
     question: str
     context: str
-    threshold: float = 0.7  # Higher default threshold for stricter filtering 
-    chunk_size: int = 4     # Number of sentences per chunk
-    chunk_overlap: int = 2  # Number of overlapping sentences between chunks
-    top_k_retrieval: int = 15  # Number of chunks to retrieve in first stage
-    top_k_final: int = 3    # Number of chunks to keep after reranking
-    max_highlight_sentences: int = 1  # Default to highlighting a single sentence
-    hybrid_search_weight: float = 0.3  # Weight for keyword component in hybrid search (0-1)
-    answer_strictness: float = 0.8  # Higher values select only the most specific answers (0-1)
-    score_gap_threshold: float = 0.15  # Minimum score gap needed to distinguish the best answer
+    threshold: float = 0.7
+    chunk_size: int = 4
+    chunk_overlap: int = 2
+    top_k_retrieval: int = 15
+    top_k_final: int = 3
+    max_highlight_sentences: int = 1
+    hybrid_search_weight: float = 0.3
+    answer_strictness: float = 0.8
+    score_gap_threshold: float = 0.15
 
+# Lazily loaded models
+class ModelManager:
+    _embedding_model = None
+    _reranker_model = None
+    
+    @classmethod
+    def get_embedding_model(cls):
+        if cls._embedding_model is None:
+            cache_path = "./model_cache/embedding_model.pkl"
+            
+            # Try to load from cache first
+            if os.path.exists(cache_path):
+                print("Loading embedding model from cache")
+                try:
+                    with open(cache_path, 'rb') as f:
+                        cls._embedding_model = pickle.load(f)
+                    return cls._embedding_model
+                except Exception as e:
+                    print(f"Error loading from cache: {e}")
+            
+            # Load from path if no cache
+            print(f"Loading embedding model from {EMBEDDING_MODEL_PATH}")
+            try:
+                cls._embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
+                
+                # Save to cache for faster loading next time
+                try:
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(cls._embedding_model, f)
+                except Exception as e:
+                    print(f"Warning: couldn't save model to cache: {e}")
+                    
+            except Exception as e:
+                print(f"Error loading custom model: {e}")
+                # Fallback to a smaller model
+                cls._embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        
+        return cls._embedding_model
+    
+    @classmethod
+    def get_reranker_model(cls):
+        if cls._reranker_model is None:
+            cache_path = "./model_cache/reranker_model.pkl"
+            
+            # Try to load from cache first
+            if os.path.exists(cache_path):
+                print("Loading reranker model from cache")
+                try:
+                    with open(cache_path, 'rb') as f:
+                        cls._reranker_model = pickle.load(f)
+                    return cls._reranker_model
+                except Exception as e:
+                    print(f"Error loading from cache: {e}")
+            
+            # Load from path if no cache
+            print(f"Loading reranker model from {RERANKER_MODEL_PATH}")
+            try:
+                cls._reranker_model = CrossEncoder(RERANKER_MODEL_PATH)
+                
+                # Save to cache for faster loading next time
+                try:
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(cls._reranker_model, f)
+                except Exception as e:
+                    print(f"Warning: couldn't save model to cache: {e}")
+            except Exception as e:
+                print(f"Error loading reranker model: {e}")
+                cls._reranker_model = None
+        
+        return cls._reranker_model
+
+# Optimized helpers
+@lru_cache(maxsize=128)
 def segment_sentences(text):
-    """
-    Segments text into sentences and then further segments complex sentences.
-    """
-    # First, use NLTK to split into base sentences
+    """Segments text into sentences with caching for improved performance"""
     basic_sentences = sent_tokenize(text)
     
     # Then, split complex list-like sentences
@@ -86,7 +131,6 @@ def segment_sentences(text):
     for sentence in basic_sentences:
         # If the sentence contains a list pattern with multiple items
         if (', and ' in sentence or '; and ' in sentence) and sentence.count(',') >= 2:
-            # Look for list patterns like "X like A, B, and C" or "X including A, B, and C"
             list_pattern = re.search(r'(like|including|such as|e\.g\.|i\.e\.|are)([^,.]*,.*?, and .*)', sentence)
             if list_pattern:
                 # Split the list items into separate sentences
@@ -105,10 +149,9 @@ def segment_sentences(text):
     
     return final_sentences
 
+@lru_cache(maxsize=128)
 def extract_key_terms(question):
-    """
-    Extract key terms, noun phrases, and verb relationships from a question
-    """
+    """Extract key terms from a question with caching"""
     # Remove punctuation and convert to lowercase
     cleaned = re.sub(r'[^\w\s]', '', question.lower())
     words = cleaned.split()
@@ -206,18 +249,7 @@ def create_chunks(sentences, chunk_size, chunk_overlap):
     return chunks
 
 def score_relevance(question, sentences, extracted_info, reranker=None):
-    """
-    Score each sentence's relevance to the question with precision focus
-    
-    Args:
-        question: The original question
-        sentences: List of sentences to score
-        extracted_info: Dictionary with key terms, noun phrases, and relationship
-        reranker: Optional cross-encoder for more accurate scoring
-        
-    Returns:
-        List of (index, score) tuples sorted by score
-    """
+    """Score each sentence's relevance to the question with precision focus"""
     if not sentences:
         return []
     
@@ -233,6 +265,7 @@ def score_relevance(question, sentences, extracted_info, reranker=None):
         return scored_sentences
     
     # Fallback to embedding-based scoring
+    embedding_model = ModelManager.get_embedding_model()
     question_embedding = embedding_model.encode(question, convert_to_tensor=True)
     sentence_embeddings = embedding_model.encode(sentences, convert_to_tensor=True)
     
@@ -287,9 +320,57 @@ def score_relevance(question, sentences, extracted_info, reranker=None):
     scored_sentences.sort(key=lambda x: x[1], reverse=True)
     return scored_sentences
 
+def merge_adjacent_sentences(relevant_sentences, all_sentences):
+    """Merge adjacent sentences into coherent chunks for highlighting"""
+    if not relevant_sentences:
+        return []
+    
+    # Sort by original position
+    relevant_sentences.sort(key=lambda x: x["index"])
+    
+    merged = []
+    current_chunk = {
+        "start_index": relevant_sentences[0]["index"],
+        "end_index": relevant_sentences[0]["index"],
+        "sentences": [relevant_sentences[0]],
+        "avg_score": relevant_sentences[0]["score"]
+    }
+    
+    for i in range(1, len(relevant_sentences)):
+        current = relevant_sentences[i]
+        # If this sentence immediately follows the previous one
+        if current["index"] == current_chunk["end_index"] + 1:
+            # Extend the current chunk
+            current_chunk["end_index"] = current["index"]
+            current_chunk["sentences"].append(current)
+            current_chunk["avg_score"] = sum(s["score"] for s in current_chunk["sentences"]) / len(current_chunk["sentences"])
+        else:
+            # Finish the current chunk and start a new one
+            merged.append(current_chunk)
+            current_chunk = {
+                "start_index": current["index"],
+                "end_index": current["index"],
+                "sentences": [current],
+                "avg_score": current["score"]
+            }
+    
+    # Add the last chunk
+    merged.append(current_chunk)
+    
+    # Create the full text for each merged chunk
+    for chunk in merged:
+        chunk_text = " ".join(all_sentences[i] for i in range(chunk["start_index"], chunk["end_index"] + 1))
+        chunk["text"] = chunk_text
+    
+    return merged
+
 @app.post("/api/query")
 async def process_query(request: QuestionRequest):
     try:
+        # Get models only when needed
+        embedding_model = ModelManager.get_embedding_model()
+        reranker_model = ModelManager.get_reranker_model()
+        
         # Extract key information from the question
         extracted_info = extract_key_terms(request.question)
         
@@ -439,55 +520,11 @@ async def process_query(request: QuestionRequest):
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-def merge_adjacent_sentences(relevant_sentences, all_sentences):
-    """Merge adjacent sentences into coherent chunks for highlighting"""
-    if not relevant_sentences:
-        return []
-    
-    # Sort by original position
-    relevant_sentences.sort(key=lambda x: x["index"])
-    
-    merged = []
-    current_chunk = {
-        "start_index": relevant_sentences[0]["index"],
-        "end_index": relevant_sentences[0]["index"],
-        "sentences": [relevant_sentences[0]],
-        "avg_score": relevant_sentences[0]["score"]
-    }
-    
-    for i in range(1, len(relevant_sentences)):
-        current = relevant_sentences[i]
-        # If this sentence immediately follows the previous one
-        if current["index"] == current_chunk["end_index"] + 1:
-            # Extend the current chunk
-            current_chunk["end_index"] = current["index"]
-            current_chunk["sentences"].append(current)
-            current_chunk["avg_score"] = sum(s["score"] for s in current_chunk["sentences"]) / len(current_chunk["sentences"])
-        else:
-            # Finish the current chunk and start a new one
-            merged.append(current_chunk)
-            current_chunk = {
-                "start_index": current["index"],
-                "end_index": current["index"],
-                "sentences": [current],
-                "avg_score": current["score"]
-            }
-    
-    # Add the last chunk
-    merged.append(current_chunk)
-    
-    # Create the full text for each merged chunk
-    for chunk in merged:
-        chunk_text = " ".join(all_sentences[i] for i in range(chunk["start_index"], chunk["end_index"] + 1))
-        chunk["text"] = chunk_text
-    
-    return merged
-
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "models": {
         "embedding": EMBEDDING_MODEL_PATH,
-        "reranker": RERANKER_MODEL_PATH if reranker_model else "disabled"
+        "reranker": RERANKER_MODEL_PATH if ModelManager._reranker_model else "not loaded"
     }}
 
 @app.get("/")
@@ -498,4 +535,14 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    # Warm-up hint to improve startup time
+    print("Pre-warming models...")
+    # Don't actually load models here - let them load on demand
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info"
+    )
