@@ -25,3 +25,4 @@ pycparser==2.22
 PyYAML==6.0.2
 threadpoolctl==3.5.0
 colorama==0.4.6
+psutil==5.9.8
